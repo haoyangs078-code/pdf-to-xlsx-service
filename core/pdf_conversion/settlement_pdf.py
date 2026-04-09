@@ -2,7 +2,9 @@
 """
 电力结算类 PDF（首页表格）解析为 Excel。
 
-输出多 sheet：基本信息、结算明细、原始表格、PDF全文、备注（与宁波宁能样本一致）。
+- layout=settlement：多 sheet（基本信息、结算明细、…），与宁波宁能样本一致。
+- layout=single_sheet：通用模式，合并**全部页面**上 pdfplumber 识别到的表格到**一张表**；
+  若无表格则退化为单列「文本」行。
 """
 
 from __future__ import annotations
@@ -10,9 +12,11 @@ from __future__ import annotations
 import io
 import re
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 import pandas as pd
+
+LayoutMode = Literal["settlement", "single_sheet"]
 
 
 def _parse_header_meta(text: str) -> List[tuple[str, str]]:
@@ -108,6 +112,49 @@ def _normalize_detail_table(raw: List[List[Any]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def _normalize_cell(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def tables_to_single_sheet_dataframe(pdf: Any) -> pd.DataFrame:
+    """
+    遍历 PDF 全部页面，合并所有 ``extract_tables()`` 结果为一张二维表。
+
+    列宽取全局最大列数，不足补空串；无任何表格时按全文行输出单列「文本」。
+    """
+    all_rows: List[List[str]] = []
+    text_chunks: List[str] = []
+
+    for page in pdf.pages:
+        text_chunks.append(page.extract_text() or "")
+        for table in page.extract_tables() or []:
+            for row in table:
+                if not row:
+                    continue
+                cells = [_normalize_cell(c) for c in row]
+                if any(cells):
+                    all_rows.append(cells)
+
+    if all_rows:
+        max_w = max(len(r) for r in all_rows)
+        max_w = max(max_w, 1)
+        padded: List[List[str]] = []
+        for r in all_rows:
+            if len(r) < max_w:
+                r = r + [""] * (max_w - len(r))
+            padded.append(r[:max_w])
+        cols = [f"列{i + 1}" for i in range(max_w)]
+        return pd.DataFrame(padded, columns=cols)
+
+    blob = "\n".join(text_chunks)
+    lines = [ln.strip() for ln in blob.splitlines() if ln.strip()]
+    if not lines:
+        return pd.DataFrame({"提示": ["未能从 PDF 中提取表格或文本"]})
+    return pd.DataFrame({"文本": lines})
+
+
 def _require_openpyxl() -> None:
     """pandas 写 xlsx 依赖 openpyxl；缺失时给出可操作的报错。"""
     try:
@@ -142,7 +189,12 @@ def _write_workbook(writer: pd.ExcelWriter, text: str, raw: List[List[Any]]) -> 
         pd.DataFrame({"备注": [remark]}).to_excel(writer, sheet_name="备注", index=False)
 
 
-def pdf_to_excel(pdf_path: Path, xlsx_path: Path) -> None:
+def pdf_to_excel(
+    pdf_path: Path,
+    xlsx_path: Path,
+    *,
+    layout: LayoutMode = "settlement",
+) -> None:
     """从本地 PDF 路径生成 xlsx 文件。"""
     import pdfplumber
 
@@ -150,23 +202,33 @@ def pdf_to_excel(pdf_path: Path, xlsx_path: Path) -> None:
     xlsx_path = xlsx_path.resolve()
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
 
+    _require_openpyxl()
     with pdfplumber.open(str(pdf_path)) as pdf:
+        if layout == "single_sheet":
+            df = tables_to_single_sheet_dataframe(pdf)
+            with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="解析结果", index=False)
+            return
+
         page = pdf.pages[0]
         text = page.extract_text() or ""
         tables = page.extract_tables() or []
         raw = tables[0] if tables else []
-
-    _require_openpyxl()
-    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        _write_workbook(writer, text, raw)
+        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+            _write_workbook(writer, text, raw)
 
 
-def pdf_bytes_to_xlsx_bytes(pdf_bytes: bytes) -> bytes:
+def pdf_bytes_to_xlsx_bytes(
+    pdf_bytes: bytes,
+    *,
+    layout: LayoutMode = "settlement",
+) -> bytes:
     """
     将 PDF 二进制转为 xlsx 二进制（内存中完成，供 HTTP 接口使用）。
 
     Args:
         pdf_bytes: PDF 文件内容
+        layout: ``settlement`` 结算单多 sheet；``single_sheet`` 通用单 sheet
 
     Returns:
         xlsx 文件字节
@@ -174,14 +236,20 @@ def pdf_bytes_to_xlsx_bytes(pdf_bytes: bytes) -> bytes:
     import pdfplumber
 
     buf_in = io.BytesIO(pdf_bytes)
+    _require_openpyxl()
+    out = io.BytesIO()
+
     with pdfplumber.open(buf_in) as pdf:
+        if layout == "single_sheet":
+            df = tables_to_single_sheet_dataframe(pdf)
+            with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="解析结果", index=False)
+            return out.getvalue()
+
         page = pdf.pages[0]
         text = page.extract_text() or ""
         tables = page.extract_tables() or []
         raw = tables[0] if tables else []
-
-    _require_openpyxl()
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        _write_workbook(writer, text, raw)
-    return out.getvalue()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            _write_workbook(writer, text, raw)
+        return out.getvalue()

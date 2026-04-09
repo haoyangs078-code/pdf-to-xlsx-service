@@ -21,10 +21,10 @@ import re
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
-from core.pdf_conversion.settlement_pdf import pdf_bytes_to_xlsx_bytes
+from core.pdf_conversion.settlement_pdf import LayoutMode, pdf_bytes_to_xlsx_bytes
 
 
 def _expected_api_key() -> Optional[str]:
@@ -35,8 +35,11 @@ def _expected_api_key() -> Optional[str]:
 def create_app() -> FastAPI:
     app = FastAPI(
         title="PDF 结算单转 Excel",
-        description="上传电力结算类 PDF（首页为表格），返回与宁波宁能样本结构一致的 xlsx。",
-        version="1.0.0",
+        description=(
+            "上传 PDF；默认 settlement 为多 sheet 结算单样式；"
+            "`layout=single_sheet` 为通用单表（合并全页表格）。"
+        ),
+        version="1.1.0",
     )
 
     @app.get("/health")
@@ -58,6 +61,10 @@ def create_app() -> FastAPI:
     )
     async def convert_pdf_to_xlsx(
         file: UploadFile = File(..., description="结算单 PDF"),
+        layout: str = Query(
+            "settlement",
+            description="settlement=多 sheet 结算解析；single_sheet=通用单 sheet",
+        ),
         x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
     ) -> Response:
         expected = _expected_api_key()
@@ -74,8 +81,15 @@ def create_app() -> FastAPI:
         if len(raw) < 5 or not raw.startswith(b"%PDF"):
             raise HTTPException(status_code=400, detail="内容不是 PDF（应以 %PDF 开头）")
 
+        if layout not in ("settlement", "single_sheet"):
+            raise HTTPException(
+                status_code=400,
+                detail="layout 须为 settlement 或 single_sheet",
+            )
+        mode: LayoutMode = "single_sheet" if layout == "single_sheet" else "settlement"
+
         try:
-            xlsx_bytes = pdf_bytes_to_xlsx_bytes(raw)
+            xlsx_bytes = pdf_bytes_to_xlsx_bytes(raw, layout=mode)
         except Exception as e:
             raise HTTPException(
                 status_code=422,

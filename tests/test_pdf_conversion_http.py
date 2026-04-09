@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import io
 import sys
 import unittest
 import zipfile
@@ -27,9 +28,27 @@ class TestPdfConversion(unittest.TestCase):
         pdf_bytes = self._sample_pdf.read_bytes()
         xlsx_bytes = pdf_bytes_to_xlsx_bytes(pdf_bytes)
         self.assertTrue(xlsx_bytes.startswith(b"PK"))
-        with zipfile.ZipFile(__import__("io").BytesIO(xlsx_bytes)) as z:
+        with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
             names = z.namelist()
         self.assertTrue(any("sheet" in n.lower() for n in names))
+
+    def test_single_sheet_one_workbook_tab(self) -> None:
+        try:
+            import openpyxl
+        except ImportError:
+            self.skipTest("未安装 openpyxl")
+        from core.pdf_conversion.settlement_pdf import pdf_bytes_to_xlsx_bytes
+
+        if not self._sample_pdf.is_file():
+            self.skipTest("样本 PDF 不存在")
+        pdf_bytes = self._sample_pdf.read_bytes()
+        xlsx_bytes = pdf_bytes_to_xlsx_bytes(pdf_bytes, layout="single_sheet")
+        self.assertTrue(xlsx_bytes.startswith(b"PK"))
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), read_only=True)
+        try:
+            self.assertEqual(wb.sheetnames, ["解析结果"])
+        finally:
+            wb.close()
 
     def test_health_endpoint(self) -> None:
         try:
@@ -57,6 +76,26 @@ class TestPdfConversion(unittest.TestCase):
         with self._sample_pdf.open("rb") as f:
             r = client.post(
                 "/v1/pdf-to-xlsx",
+                files={"file": ("sample.pdf", f, "application/pdf")},
+            )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.content.startswith(b"PK"))
+
+    def test_convert_sample_pdf_single_sheet_query(self) -> None:
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("未安装 fastapi")
+        if not self._sample_pdf.is_file():
+            self.skipTest("样本 PDF 不存在")
+
+        from core.pdf_conversion.http_service import create_app
+
+        client = TestClient(create_app())
+        with self._sample_pdf.open("rb") as f:
+            r = client.post(
+                "/v1/pdf-to-xlsx",
+                params={"layout": "single_sheet"},
                 files={"file": ("sample.pdf", f, "application/pdf")},
             )
         self.assertEqual(r.status_code, 200, r.text)
